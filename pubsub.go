@@ -94,7 +94,7 @@ type cmd struct {
 
 type msgEnvelope struct {
 	topics []string
-	ch     chan interface{}
+	done   chan<- bool
 	msg    interface{}
 	opts   pubOptions
 }
@@ -126,9 +126,7 @@ func New(ctx context.Context, capacity int) PubSub {
 		capacity:  capacity,
 	}
 
-	ps.group.Go(func() error {
-		return ps.start()
-	})
+	ps.group.Go(ps.run)
 
 	return ps
 }
@@ -180,6 +178,8 @@ func (ps *pubSub) AddTopics(ch <-chan interface{}, topics ...string) {
 
 // Pub publishes the given message to all subscribers of the specified topics.
 func (ps *pubSub) Pub(msg interface{}, topics []string, opts ...PubOption) {
+	done := make(chan bool, 1)
+
 	op := pubOptions{}
 
 	for _, opt := range opts {
@@ -188,7 +188,12 @@ func (ps *pubSub) Pub(msg interface{}, topics []string, opts ...PubOption) {
 
 	select {
 	case <-ps.ctx.Done():
-	case ps.msgch <- msgEnvelope{topics: topics, msg: msg, opts: op}:
+	case ps.msgch <- msgEnvelope{topics: topics, done: done, msg: msg, opts: op}:
+	}
+
+	select {
+	case <-ps.ctx.Done():
+	case <-done:
 	}
 }
 
@@ -202,6 +207,7 @@ func (ps *pubSub) Pub(msg interface{}, topics []string, opts ...PubOption) {
 // get lost at the receivers end if that channel is full
 // If err!=nil, one idea could be to spawn an anonymous goroutine to try again
 func (ps *pubSub) TryPub(msg interface{}, topics []string, opts ...PubOption) bool {
+	done := make(chan bool, 1)
 	op := pubOptions{}
 
 	for _, opt := range opts {
@@ -211,7 +217,7 @@ func (ps *pubSub) TryPub(msg interface{}, topics []string, opts ...PubOption) bo
 	select {
 	case <-ps.ctx.Done():
 		return false
-	case ps.msgch <- msgEnvelope{topics: topics, msg: msg, opts: op}:
+	case ps.msgch <- msgEnvelope{topics: topics, done: done, msg: msg, opts: op}:
 	default:
 		return false
 	}
@@ -244,13 +250,18 @@ func (ps *pubSub) Unsub(ch <-chan interface{}, topics ...string) {
 
 // Shutdown closes all subscribed channels and terminates the goroutine.
 func (ps *pubSub) Shutdown() {
-	ps.cancel()
+	select {
+	case <-ps.ctx.Done():
+		return
+	default:
+	}
 
+	ps.cancel()
 	_ = ps.group.Wait()
 }
 
 // Main Cmd Handling Goroutine
-func (ps *pubSub) start() error {
+func (ps *pubSub) run() error {
 	for {
 		select {
 		case <-ps.ctx.Done():
@@ -279,16 +290,13 @@ func (ps *pubSub) start() error {
 				ps.remove(cmd.topics, cmd.ch.(<-chan interface{}))
 			}
 
-			select {
-			case <-ps.ctx.Done():
-				return ps.ctx.Err()
-			case cmd.done <- true:
-			default:
+			cmd.done <- true
+		case envelope := <-ps.msgch:
+			for _, topic := range envelope.topics {
+				ps.send(topic, envelope.msg, envelope.opts)
 			}
-		case msg := <-ps.msgch:
-			for _, topic := range msg.topics {
-				ps.send(topic, msg.msg, msg.opts)
-			}
+
+			envelope.done <- true
 		}
 	}
 }
@@ -304,8 +312,6 @@ func (s *subscriber) run() error {
 	var cmdch chan<- cmd
 
 	done := make(chan bool, 1)
-
-	c := cmd{op: unsub, ch: (<-chan interface{})(s.och), done: done}
 
 	for {
 		select {
@@ -336,7 +342,7 @@ func (s *subscriber) run() error {
 			} else {
 				och = nil
 			}
-		case cmdch <- c:
+		case cmdch <- cmd{op: unsub, ch: (<-chan interface{})(s.och), done: done}:
 		}
 	}
 }
@@ -364,23 +370,40 @@ func (ps *pubSub) add(topics []string, sub *subscriber) {
 		ps.revTopics[sub.och].topics[tn] = true
 
 		if tp.retained != nil {
-			sub.och <- ps.topics[tn].retained
+			sub.ich <- tp.retained
 		}
 	}
 }
 
-func (ps *pubSub) send(topic string, msg interface{}, opts pubOptions) {
-	topicParams := ps.topics[topic]
+func (ps *pubSub) send(to string, msg interface{}, opts pubOptions) {
+	tp := ps.topics[to]
 
-	if topicParams == nil {
+	if tp == nil && !opts.retain {
 		return
 	}
 
-	if opts.retain {
-		topicParams.retained = msg
+	if msg == nil && tp != nil {
+		tp.retained = nil
+		if len(ps.topics[to].subs) == 0 {
+			delete(ps.topics, to)
+		}
+
+		return
 	}
 
-	for _, sub := range topicParams.subs {
+	if tp == nil {
+		tp = &topic{
+			subs: make(topicSubs),
+		}
+	}
+
+	ps.topics[to] = tp
+
+	if opts.retain {
+		tp.retained = msg
+	}
+
+	for _, sub := range tp.subs {
 		select {
 		case <-ps.ctx.Done():
 			return

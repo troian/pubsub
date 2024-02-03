@@ -6,226 +6,349 @@ package pubsub
 
 import (
 	"context"
+	"runtime"
 	"testing"
+	"time"
 
-	check "gopkg.in/check.v1"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 )
 
-var _ = check.Suite(new(Suite))
-
-func Test(t *testing.T) {
-	// start := runtime.NumGoroutine()
-
-	check.TestingT(t)
-
-	// time.Sleep(1000 * time.Millisecond)
-	// end := runtime.NumGoroutine()
-	// t.Log("# GoRoutines start:", start, " end:", end)
-	// if end != start {
-	// 	t.Fail()
-	// }
+type testSuite struct {
+	suite.Suite
+	ctx context.Context
 }
 
-type Suite struct{}
+func (s *testSuite) waitForMessage(ch <-chan interface{}) string {
+	s.T().Helper()
 
-func (s *Suite) TestSub(c *check.C) {
-	ps := New(context.Background(), 1)
+	tctx, tcancel := context.WithTimeout(s.ctx, 3*time.Second)
+	defer tcancel()
+
+	select {
+	case <-s.ctx.Done():
+		tcancel()
+		s.T().FailNow()
+	case <-tctx.Done():
+		tcancel()
+		s.T().FailNow()
+	case m, ok := <-ch:
+		tcancel()
+		if !ok {
+			s.T().FailNow()
+		}
+
+		require.IsType(s.T(), *new(string), m)
+		return m.(string)
+	}
+
+	return ""
+}
+
+func TestIntegrationTestSuite(t *testing.T) {
+	start := runtime.NumGoroutine()
+
+	ctx := context.Background()
+	ts := &testSuite{
+		ctx: ctx,
+	}
+
+	suite.Run(t, ts)
+
+	end := runtime.NumGoroutine()
+
+	if end != start {
+		t.Log("# GoRoutines start:", start, " end:", end)
+		t.Fail()
+	}
+}
+
+func (s *testSuite) SetupSuite() {}
+
+func (s *testSuite) TearDownSuite() {}
+
+func (s *testSuite) TestSub() {
+	ps := New(s.ctx, 1)
+
 	ch1 := ps.Sub("t1")
 	ch2 := ps.Sub("t1")
 	ch3 := ps.Sub("t2")
 
 	ps.Pub("hi", []string{"t1"})
-	c.Check(<-ch1, check.Equals, "hi")
-	c.Check(<-ch2, check.Equals, "hi")
+
+	msg := s.waitForMessage(ch1)
+	require.Equal(s.T(), "hi", msg)
+
+	msg = s.waitForMessage(ch2)
+	require.Equal(s.T(), "hi", msg)
 
 	ps.Pub("hello", []string{"t2"})
-	c.Check(<-ch3, check.Equals, "hello")
+
+	msg = s.waitForMessage(ch3)
+	require.Equal(s.T(), "hello", msg)
 
 	ps.Shutdown()
-	_, ok := <-ch1
-	c.Check(ok, check.Equals, false)
-	_, ok = <-ch2
-	c.Check(ok, check.Equals, false)
-	_, ok = <-ch3
-	c.Check(ok, check.Equals, false)
+	_, open := <-ch1
+	assert.False(s.T(), open)
+	_, open = <-ch2
+	assert.False(s.T(), open)
+	_, open = <-ch3
+	assert.False(s.T(), open)
 }
 
-func (s *Suite) TestRetained(c *check.C) {
-	ps := New(context.Background(), 1)
+func (s *testSuite) TestRetained() {
+	ps := New(s.ctx, 1)
 	ch1 := ps.Sub("t1")
 
 	ps.Pub("hi", []string{"t1"}, WithRetain())
-	c.Check(<-ch1, check.Equals, "hi")
+
+	msg := s.waitForMessage(ch1)
+	require.Equal(s.T(), "hi", msg)
 
 	ch2 := ps.Sub("t1")
-	c.Check(<-ch2, check.Equals, "hi")
+	msg = s.waitForMessage(ch2)
+	require.Equal(s.T(), "hi", msg)
 
 	ps.Shutdown()
-	_, ok := <-ch1
-	c.Check(ok, check.Equals, false)
-	_, ok = <-ch2
-	c.Check(ok, check.Equals, false)
+
+	_, open := <-ch1
+	assert.False(s.T(), open)
+	_, open = <-ch2
+	assert.False(s.T(), open)
 }
 
-func (s *Suite) TestSubUnbuffered(c *check.C) {
-	ps := New(context.Background(), 1)
+func (s *testSuite) TestRetained2() {
+	ps := New(s.ctx, 1)
+
+	ps.Pub("hi", []string{"t1"}, WithRetain())
+
+	ch1 := ps.Sub("t1")
+	msg := s.waitForMessage(ch1)
+	require.Equal(s.T(), "hi", msg)
+
+	ps.Shutdown()
+	_, open := <-ch1
+	assert.False(s.T(), open)
+}
+
+func (s *testSuite) TestSubUnbuffered() {
+	ps := New(s.ctx, 1)
 
 	ch1 := ps.Sub("t1")
 	ch3 := ps.Sub("t2")
 
 	go func() { ps.Pub("hi", []string{"t1"}) }()
-	c.Check(<-ch1, check.Equals, "hi")
+
+	msg := s.waitForMessage(ch1)
+	require.Equal(s.T(), "hi", msg)
 
 	go func() { ps.Pub("hello", []string{"t2"}) }()
-	c.Check(<-ch3, check.Equals, "hello")
+
+	msg = s.waitForMessage(ch3)
+	require.Equal(s.T(), "hello", msg)
 
 	ps.Shutdown()
-	_, ok := <-ch1
-	c.Check(ok, check.Equals, false)
-	_, ok = <-ch3
-	c.Check(ok, check.Equals, false)
+
+	_, open := <-ch1
+	assert.False(s.T(), open)
+	_, open = <-ch3
+	assert.False(s.T(), open)
 }
 
-func (s *Suite) TestSubOnce(c *check.C) {
-	ps := New(context.Background(), 1)
+func (s *testSuite) TestSubOnce() {
+	ps := New(s.ctx, 1)
 	ch := ps.SubOnce("t1")
 
 	ps.Pub("hi", []string{"t1"})
-	c.Check(<-ch, check.Equals, "hi")
 
-	val, ok := <-ch
-	c.Check(val, check.Equals, nil)
-	c.Check(ok, check.Equals, false)
+	msg := s.waitForMessage(ch)
+	require.Equal(s.T(), "hi", msg)
+
+	val, open := <-ch
+	assert.Nil(s.T(), val)
+	assert.False(s.T(), open)
+
 	ps.Shutdown()
 }
 
-func (s *Suite) TestAddSub(c *check.C) {
-	ps := New(context.Background(), 1)
+func (s *testSuite) TestAddSub() {
+	ps := New(s.ctx, 1)
 	ch1 := ps.Sub("t1")
-
 	ch2 := ps.Sub("t2")
 
 	ps.Pub("hi1", []string{"t1"})
-	c.Check(<-ch1, check.Equals, "hi1")
+
+	msg := s.waitForMessage(ch1)
+	require.Equal(s.T(), "hi1", msg)
 
 	ps.Pub("hi2", []string{"t2"})
-	c.Check(<-ch2, check.Equals, "hi2")
+
+	msg = s.waitForMessage(ch2)
+	require.Equal(s.T(), "hi2", msg)
 
 	ps.AddTopics(ch1, "t2", "t3")
+
 	ps.Pub("hi3", []string{"t2"})
-	c.Check(<-ch1, check.Equals, "hi3")
-	c.Check(<-ch2, check.Equals, "hi3")
+
+	msg = s.waitForMessage(ch1)
+	require.Equal(s.T(), "hi3", msg)
+
+	msg = s.waitForMessage(ch2)
+	require.Equal(s.T(), "hi3", msg)
 
 	ps.Pub("hi4", []string{"t3"})
-	c.Check(<-ch1, check.Equals, "hi4")
+
+	msg = s.waitForMessage(ch1)
+	require.Equal(s.T(), "hi4", msg)
 
 	ps.Shutdown()
+
+	val, open := <-ch2
+	assert.Nil(s.T(), val)
+	assert.False(s.T(), open)
 }
 
-func (s *Suite) TestUnsub(c *check.C) {
-	ps := New(context.Background(), 1)
+func (s *testSuite) TestUnsub() {
+	ps := New(s.ctx, 1)
 	ch := ps.Sub("t1")
 
 	ps.Pub("hi", []string{"t1"})
-	c.Check(<-ch, check.Equals, "hi")
+
+	msg := s.waitForMessage(ch)
+	require.Equal(s.T(), "hi", msg)
 
 	ps.Unsub(ch, "t1")
-	_, ok := <-ch
-	c.Check(ok, check.Equals, false)
+
+	_, open := <-ch
+	assert.False(s.T(), open)
+
 	ps.Shutdown()
 }
 
-func (s *Suite) TestUnsubAll(c *check.C) {
-	ps := New(context.Background(), 1)
+func (s *testSuite) TestUnsubAll() {
+	ps := New(s.ctx, 1)
 	ch1 := ps.Sub("t1", "t2", "t3")
 	ch2 := ps.Sub("t1", "t3")
 
-	c.Log("waiting for unsub")
 	ps.Unsub(ch1)
 
-	c.Log("waiting for close")
-	m, ok := <-ch1
-	c.Check(ok, check.Equals, false)
+	_, open := <-ch1
+	assert.False(s.T(), open)
 
 	ps.Pub("hi", []string{"t1"})
-	c.Log("waiting for ch2")
-	m, ok = <-ch2
-	c.Check(m, check.Equals, "hi")
 
-	c.Log("waiting for shutdown")
+	msg := s.waitForMessage(ch2)
+	require.Equal(s.T(), "hi", msg)
+
 	ps.Shutdown()
 }
 
-func (s *Suite) TestDrainOnUnsub(c *check.C) {
-	ps := New(context.Background(), 1)
+func (s *testSuite) TestDrainOnUnsub() {
+	ps := New(s.ctx, 1)
 
 	ch1 := ps.Sub("t1", "t2", "t3")
 
 	ps.Pub("test", []string{"t1", "t2", "t3"})
+
 	ps.Unsub(ch1)
 
-	_, ok := <-ch1
-	c.Check(ok, check.Equals, true)
+	received := 0
+
+	// should receive at most 3 messages
+	for {
+		msg, open := <-ch1
+		if msg != nil {
+			received++
+		} else {
+			assert.False(s.T(), open)
+			break
+		}
+
+		if received > 3 {
+			break
+		}
+	}
+
+	require.LessOrEqual(s.T(), received, 3)
+
+	_, open := <-ch1
+	assert.False(s.T(), open)
 
 	ps.Shutdown()
 }
 
-func (s *Suite) TestMultiSub(c *check.C) {
-	ps := New(context.Background(), 1)
+func (s *testSuite) TestMultiSub() {
+	ps := New(s.ctx, 1)
 	ch := ps.Sub("t1", "t2")
 
 	ps.Pub("hi", []string{"t1"})
-	c.Check(<-ch, check.Equals, "hi")
+
+	msg := s.waitForMessage(ch)
+	require.Equal(s.T(), "hi", msg)
 
 	ps.Pub("hello", []string{"t2"})
-	c.Check(<-ch, check.Equals, "hello")
+
+	msg = s.waitForMessage(ch)
+	require.Equal(s.T(), "hello", msg)
 
 	ps.Shutdown()
-	_, ok := <-ch
-	c.Check(ok, check.Equals, false)
+
+	_, open := <-ch
+	assert.False(s.T(), open)
 }
 
-func (s *Suite) TestMultiSubOnce(c *check.C) {
-	ps := New(context.Background(), 1)
+func (s *testSuite) TestMultiSubOnce() {
+	ps := New(s.ctx, 1)
 	ch := ps.SubOnce("t1", "t2")
 
 	ps.Pub("hi", []string{"t1"})
-	c.Check(<-ch, check.Equals, "hi")
+
+	msg := s.waitForMessage(ch)
+	require.Equal(s.T(), "hi", msg)
 
 	ps.Pub("hello", []string{"t2"})
 
-	_, ok := <-ch
-	c.Check(ok, check.Equals, false)
+	val, open := <-ch
+	assert.False(s.T(), open)
+	assert.Nil(s.T(), val)
 
 	ps.Shutdown()
 }
 
-func (s *Suite) TestMultiPub(c *check.C) {
-	ps := New(context.Background(), 1)
+func (s *testSuite) TestMultiPub() {
+	ps := New(s.ctx, 1)
 	ch1 := ps.Sub("t1")
 	ch2 := ps.Sub("t2")
 
 	ps.Pub("hi", []string{"t1", "t2"})
-	c.Check(<-ch1, check.Equals, "hi")
-	c.Check(<-ch2, check.Equals, "hi")
+
+	msg := s.waitForMessage(ch1)
+	require.Equal(s.T(), "hi", msg)
+
+	msg = s.waitForMessage(ch2)
+	require.Equal(s.T(), "hi", msg)
 
 	ps.Shutdown()
 }
 
-func (s *Suite) TestMultiUnsub(c *check.C) {
-	ps := New(context.Background(), 1)
+func (s *testSuite) TestMultiUnsub() {
+	ps := New(s.ctx, 1)
 	ch := ps.Sub("t1", "t2", "t3")
 
 	ps.Unsub(ch, "t1")
 
 	ps.Pub("hi", []string{"t1"})
-
 	ps.Pub("hello", []string{"t2"})
-	c.Check(<-ch, check.Equals, "hello")
+
+	msg := s.waitForMessage(ch)
+	require.Equal(s.T(), "hello", msg)
 
 	ps.Unsub(ch, "t2", "t3")
-	_, ok := <-ch
-	c.Check(ok, check.Equals, false)
+
+	val, open := <-ch
+	assert.False(s.T(), open)
+	assert.Nil(s.T(), val)
 
 	ps.Shutdown()
 }

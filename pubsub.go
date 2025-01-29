@@ -279,8 +279,8 @@ func (ps *pubSub) run() error {
 					cmdch: ps.cmdch,
 					once:  cmd.op == subOnce,
 				}
-				ps.add(cmd.topics, subs)
 				ps.group.Go(subs.run)
+				ps.add(cmd.topics, subs)
 			case subAdd:
 				ch := cmd.ch.(<-chan interface{})
 				subs := ps.revTopics[ch].sub
